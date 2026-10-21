@@ -2281,14 +2281,27 @@
     }
 
     function chooseWanderTarget(koi) {
-      const angle = range(0, Math.PI * 2);
-      const radius = Math.sqrt(random()) * 4.8;
+      // Prefer open-water targets that are a few body lengths away and
+      // roughly ahead, so koi glide on instead of U-turning in place.
+      const forwardX = Math.cos(koi.yaw);
+      const forwardZ = -Math.sin(koi.yaw);
+      let x = 0;
+      let z = 0;
 
-      koi.wanderTarget.set(
-        Math.cos(angle) * radius,
-        range(-0.17, -0.025),
-        Math.sin(angle) * radius
-      );
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const angle = range(0, Math.PI * 2);
+        const radius = Math.sqrt(random()) * 4.6;
+        x = Math.cos(angle) * radius;
+        z = Math.sin(angle) * radius;
+
+        const dx = x - koi.root.position.x;
+        const dz = z - koi.root.position.z;
+        const distance = Math.hypot(dx, dz);
+        const ahead = distance > 0 ? (dx * forwardX + dz * forwardZ) / distance : 0;
+        if (distance > 1.8 && ahead > -0.2) break;
+      }
+
+      koi.wanderTarget.set(x, range(-0.17, -0.025), z);
       koi.wanderTimer = range(3.5, 8.5);
     }
 
@@ -2827,263 +2840,226 @@
     scene.add(fireflies);
 
     // ------------------------------------------------------------------
-    // Koi avoidance steering and hard collision constraints
+    // Koi soft avoidance (hand-tuned fix): capsule-shaped bodies,
+    // steering forces blended into velocity, one gentle correction pass.
+    // Lily pads float on the surface, so koi swim underneath them.
     // ------------------------------------------------------------------
 
-    function getPondExtent(koi) {
-      const radius = Math.hypot(
-        koi.root.position.x,
-        koi.root.position.z
-      );
+    const SOLID_OBSTACLES = swimObstacles.filter(
+      (obstacle) => obstacle.type !== "lily"
+    );
 
-      if (radius < 0.0001) return koi.collisionRadius;
-
-      const outwardX = koi.root.position.x / radius;
-      const outwardZ = koi.root.position.z / radius;
-
+    // Capsule along the koi's spine: snout ~0.62, tail root ~-0.78,
+    // half-width ~0.22 (all multiplied by the koi's scale).
+    function koiCapsule(koi, out) {
       const forwardX = Math.cos(koi.yaw);
       const forwardZ = -Math.sin(koi.yaw);
-
-      const forwardProjection =
-        forwardX * outwardX + forwardZ * outwardZ;
-
-      const perpendicularProjection = Math.sqrt(
-        Math.max(0, 1 - forwardProjection * forwardProjection)
-      );
-
-      // Conservative support radius of the body in the outward direction.
-      const bodyExtent =
-        0.86 * koi.scale * Math.abs(forwardProjection) +
-        0.31 * koi.scale * perpendicularProjection;
-
-      let extent = bodyExtent;
-
-      // The tail sits behind the body and can point outward while the
-      // fish turns, so include its actual reach as well.
-      if (forwardProjection < 0) {
-        const tailExtent =
-          1.34 * koi.scale * Math.abs(forwardProjection) +
-          0.17 * koi.scale * perpendicularProjection;
-
-        extent = Math.max(extent, tailExtent);
-      }
-
-      return extent;
+      const s = koi.scale;
+      out.ax = koi.root.position.x + forwardX * 0.62 * s;
+      out.az = koi.root.position.z + forwardZ * 0.62 * s;
+      out.bx = koi.root.position.x - forwardX * 0.78 * s;
+      out.bz = koi.root.position.z - forwardZ * 0.78 * s;
+      out.r = 0.22 * s;
+      return out;
     }
 
-    function constrainToPond(koi) {
-      const radius = Math.hypot(
-        koi.root.position.x,
-        koi.root.position.z
-      );
+    const capsuleA = {};
+    const capsuleB = {};
+    const closest = { d: 0, nx: 0, nz: 0 };
 
-      const maximumRadius =
-        POND_WATER_RADIUS - getPondExtent(koi) - 0.025;
+    function closestOnSegment(ax, az, bx, bz, px, pz) {
+      const dx = bx - ax;
+      const dz = bz - az;
+      const lengthSq = dx * dx + dz * dz;
+      let t = lengthSq > 1e-9 ? ((px - ax) * dx + (pz - az) * dz) / lengthSq : 0;
+      t = clamp(t, 0, 1);
+      return t;
+    }
 
-      if (radius > maximumRadius && radius > 0.0001) {
-        const correction = maximumRadius / radius;
-        koi.root.position.x *= correction;
-        koi.root.position.z *= correction;
+    // Closest distance between two 2D segments; normal points from B to A.
+    function segmentDistance(A, B, out) {
+      let best = Infinity;
+      let bestNx = 1;
+      let bestNz = 0;
+      const test = (px, pz, sx0, sz0, sx1, sz1, flip) => {
+        const t = closestOnSegment(sx0, sz0, sx1, sz1, px, pz);
+        const qx = sx0 + (sx1 - sx0) * t;
+        const qz = sz0 + (sz1 - sz0) * t;
+        let nx = px - qx;
+        let nz = pz - qz;
+        const d = Math.hypot(nx, nz);
+        if (d < best) {
+          best = d;
+          if (d > 1e-6) {
+            nx /= d;
+            nz /= d;
+          } else {
+            nx = 1;
+            nz = 0;
+          }
+          bestNx = flip ? -nx : nx;
+          bestNz = flip ? -nz : nz;
+        }
+      };
+      test(A.ax, A.az, B.ax, B.az, B.bx, B.bz, false);
+      test(A.bx, A.bz, B.ax, B.az, B.bx, B.bz, false);
+      test(B.ax, B.az, A.ax, A.az, A.bx, A.bz, true);
+      test(B.bx, B.bz, A.ax, A.az, A.bx, A.bz, true);
+      // Crossing segments: push apart along the centre line.
+      if (best > 1e-6) {
+        const d1 = (B.bx - B.ax) * (A.az - B.az) - (B.bz - B.az) * (A.ax - B.ax);
+        const d2 = (B.bx - B.ax) * (A.bz - B.az) - (B.bz - B.az) * (A.bx - B.ax);
+        const d3 = (A.bx - A.ax) * (B.az - A.az) - (A.bz - A.az) * (B.ax - A.ax);
+        const d4 = (A.bx - A.ax) * (B.bz - A.az) - (A.bz - A.az) * (B.bx - A.ax);
+        if (d1 * d2 < 0 && d3 * d4 < 0) best = 0;
       }
+      if (best <= 1e-6) {
+        const cx = (A.ax + A.bx - B.ax - B.bx) * 0.5;
+        const cz = (A.az + A.bz - B.az - B.bz) * 0.5;
+        const cl = Math.hypot(cx, cz) || 1;
+        bestNx = cx / cl;
+        bestNz = cz / cl;
+      }
+      out.d = best;
+      out.nx = bestNx;
+      out.nz = bestNz;
+      return out;
+    }
+
+    function safePondRadius(koi) {
+      return POND_WATER_RADIUS - 0.3 * koi.scale - 0.05;
     }
 
     function computeAvoidanceSteering(koi) {
       let avoidX = 0;
       let avoidZ = 0;
+      koiCapsule(koi, capsuleA);
 
-      // Peer avoidance uses each koi's own scaled body radius.
+      // Other koi: soft repulsion that ramps up near contact.
       for (const other of fish) {
         if (other === koi) continue;
+        const roughDistance = Math.hypot(
+          other.root.position.x - koi.root.position.x,
+          other.root.position.z - koi.root.position.z
+        );
+        if (roughDistance > 3.2) continue;
 
-        const predictedX =
-          koi.root.position.x +
-          koi.velocity.x * 0.45 -
-          (other.root.position.x + other.velocity.x * 0.45);
+        koiCapsule(other, capsuleB);
+        segmentDistance(capsuleA, capsuleB, closest);
 
-        const predictedZ =
-          koi.root.position.z +
-          koi.velocity.y * 0.45 -
-          (other.root.position.z + other.velocity.y * 0.45);
+        const contact = capsuleA.r + capsuleB.r + 0.06;
+        const influence = 0.5 * koi.scale;
+        const gap = closest.d - contact;
+        if (gap > influence) continue;
 
-        const distance = Math.hypot(predictedX, predictedZ);
-        const minimumSeparation =
-          koi.collisionRadius +
-          other.collisionRadius +
-          0.035;
+        const k = clamp(1 - gap / influence, 0, 2.5);
+        const strength = k * k * 1.1;
+        avoidX += closest.nx * strength;
+        avoidZ += closest.nz * strength;
 
-        const lookAhead = minimumSeparation + 1.2;
-
-        if (distance < lookAhead) {
-          let normalX;
-          let normalZ;
-
-          if (distance < 0.0001) {
-            normalX = Math.cos(koi.phase);
-            normalZ = Math.sin(koi.phase);
-          } else {
-            normalX = predictedX / distance;
-            normalZ = predictedZ / distance;
-          }
-
-          const strength = clamp(
-            (lookAhead - distance) / lookAhead,
-            0,
-            1.25
-          );
-
-          avoidX += normalX * strength;
-          avoidZ += normalZ * strength;
-
-          // A small tangential component helps fish slide around one
-          // another instead of stopping head-on.
-          const side =
-            ((koi.root.id + other.root.id) & 1) === 0 ? 1 : -1;
-
-          avoidX += -normalZ * strength * 0.24 * side;
-          avoidZ += normalX * strength * 0.24 * side;
-        }
+        // Slide past each other instead of stalling head-on.
+        const side = koi.root.id < other.root.id ? 1 : -1;
+        avoidX += -closest.nz * strength * 0.3 * side;
+        avoidZ += closest.nx * strength * 0.3 * side;
       }
 
-      // Rocks, lily pads, and the waterfall use the same collision
-      // distances as the final constraint solver.
-      for (let i = 0; i < swimObstacles.length; i++) {
-        const obstacle = swimObstacles[i];
-
-        const predictedX =
-          koi.root.position.x +
-          koi.velocity.x * 0.4 -
-          obstacle.x;
-
-        const predictedZ =
-          koi.root.position.z +
-          koi.velocity.y * 0.4 -
-          obstacle.z;
-
-        const distance = Math.hypot(predictedX, predictedZ);
-        const minimumSeparation =
-          koi.collisionRadius +
-          obstacle.radius +
-          0.025;
-
-        const lookAhead = minimumSeparation + 1.05;
-
-        if (distance < lookAhead) {
-          let normalX;
-          let normalZ;
-
-          if (distance < 0.0001) {
-            normalX = 1;
-            normalZ = 0;
-          } else {
-            normalX = predictedX / distance;
-            normalZ = predictedZ / distance;
-          }
-
-          const strength = clamp(
-            (lookAhead - distance) / lookAhead,
-            0,
-            1.4
-          );
-
-          avoidX += normalX * strength * 1.25;
-          avoidZ += normalZ * strength * 1.25;
-
-          const side = ((koi.root.id + i) & 1) === 0 ? 1 : -1;
-          avoidX += -normalZ * strength * 0.5 * side;
-          avoidZ += normalX * strength * 0.5 * side;
-        }
+      // Rocks and the waterfall base (not lily pads).
+      for (const obstacle of SOLID_OBSTACLES) {
+        const t = closestOnSegment(
+          capsuleA.ax, capsuleA.az, capsuleA.bx, capsuleA.bz,
+          obstacle.x, obstacle.z
+        );
+        const px = capsuleA.ax + (capsuleA.bx - capsuleA.ax) * t;
+        const pz = capsuleA.az + (capsuleA.bz - capsuleA.az) * t;
+        const dx = px - obstacle.x;
+        const dz = pz - obstacle.z;
+        const distance = Math.hypot(dx, dz) || 1e-6;
+        const gap = distance - obstacle.radius - capsuleA.r;
+        const influence = 0.8;
+        if (gap > influence) continue;
+        const k = clamp(1 - gap / influence, 0, 2.5);
+        avoidX += (dx / distance) * k * k * 1.2;
+        avoidZ += (dz / distance) * k * k * 1.2;
       }
 
-      // Begin steering inward before the body reaches the pond bank.
-      const radius = Math.hypot(
-        koi.root.position.x,
-        koi.root.position.z
-      );
-
-      const maximumRadius =
-        POND_WATER_RADIUS - getPondExtent(koi) - 0.025;
-
-      if (radius > maximumRadius - 0.85 && radius > 0.0001) {
-        const strength =
-          clamp((radius - (maximumRadius - 0.85)) / 0.85, 0, 1.4);
-
-        avoidX -= (koi.root.position.x / radius) * strength * 1.5;
-        avoidZ -= (koi.root.position.z / radius) * strength * 1.5;
+      // Pond edge: steer inward as the snout or tail approaches the bank.
+      const limit = safePondRadius(koi);
+      const radiusHead = Math.hypot(capsuleA.ax, capsuleA.az);
+      const radiusTail = Math.hypot(capsuleA.bx, capsuleA.bz);
+      const outer = Math.max(radiusHead, radiusTail);
+      const centreRadius = Math.hypot(koi.root.position.x, koi.root.position.z);
+      if (outer > limit - 0.7 && centreRadius > 1e-4) {
+        const k = clamp((outer - (limit - 0.7)) / 0.7, 0, 2);
+        avoidX -= (koi.root.position.x / centreRadius) * k * k * 1.6;
+        avoidZ -= (koi.root.position.z / centreRadius) * k * k * 1.6;
       }
 
       return { x: avoidX, z: avoidZ };
     }
 
+    // One gentle correction pass (no iteration loop): resolves only a
+    // fraction of any remaining overlap and damps the closing velocity.
     function resolveFishConstraints() {
-      // Iterative positional constraints guarantee that bodies do not
-      // intersect even when several fish converge on the same food.
-      for (let iteration = 0; iteration < 10; iteration++) {
-        for (let i = 0; i < fish.length; i++) {
-          for (let j = i + 1; j < fish.length; j++) {
-            const a = fish[i];
-            const b = fish[j];
+      for (let i = 0; i < fish.length; i++) {
+        const a = fish[i];
+        koiCapsule(a, capsuleA);
+        for (let j = i + 1; j < fish.length; j++) {
+          const b = fish[j];
+          koiCapsule(b, capsuleB);
+          segmentDistance(capsuleA, capsuleB, closest);
+          const contact = capsuleA.r + capsuleB.r;
+          if (closest.d >= contact) continue;
 
-            let dx = b.root.position.x - a.root.position.x;
-            let dz = b.root.position.z - a.root.position.z;
-            let distance = Math.hypot(dx, dz);
+          const push = (contact - closest.d) * 0.3;
+          a.root.position.x += closest.nx * push;
+          a.root.position.z += closest.nz * push;
+          b.root.position.x -= closest.nx * push;
+          b.root.position.z -= closest.nz * push;
 
-            const minimumSeparation =
-              a.collisionRadius +
-              b.collisionRadius +
-              0.035;
+          const closing =
+            (a.velocity.x - b.velocity.x) * closest.nx +
+            (a.velocity.y - b.velocity.y) * closest.nz;
+          if (closing < 0) {
+            a.velocity.x -= closest.nx * closing * 0.5;
+            a.velocity.y -= closest.nz * closing * 0.5;
+            b.velocity.x += closest.nx * closing * 0.5;
+            b.velocity.y += closest.nz * closing * 0.5;
+          }
+          koiCapsule(a, capsuleA);
+        }
+      }
 
-            if (distance < minimumSeparation) {
-              if (distance < 0.00001) {
-                const angle =
-                  (i * 12.9898 + j * 78.233) % (Math.PI * 2);
-                dx = Math.cos(angle);
-                dz = Math.sin(angle);
-                distance = 1;
-              }
-
-              const normalX = dx / distance;
-              const normalZ = dz / distance;
-              const correction =
-                (minimumSeparation - distance) * 0.5 + 0.0001;
-
-              a.root.position.x -= normalX * correction;
-              a.root.position.z -= normalZ * correction;
-              b.root.position.x += normalX * correction;
-              b.root.position.z += normalZ * correction;
-            }
+      for (const koi of fish) {
+        koiCapsule(koi, capsuleA);
+        for (const obstacle of SOLID_OBSTACLES) {
+          const t = closestOnSegment(
+            capsuleA.ax, capsuleA.az, capsuleA.bx, capsuleA.bz,
+            obstacle.x, obstacle.z
+          );
+          const px = capsuleA.ax + (capsuleA.bx - capsuleA.ax) * t;
+          const pz = capsuleA.az + (capsuleA.bz - capsuleA.az) * t;
+          const dx = px - obstacle.x;
+          const dz = pz - obstacle.z;
+          const distance = Math.hypot(dx, dz) || 1e-6;
+          const penetration = obstacle.radius + capsuleA.r - distance;
+          if (penetration > 0) {
+            koi.root.position.x += (dx / distance) * penetration * 0.5;
+            koi.root.position.z += (dz / distance) * penetration * 0.5;
           }
         }
 
-        for (const koi of fish) {
-          for (const obstacle of swimObstacles) {
-            const dx = koi.root.position.x - obstacle.x;
-            const dz = koi.root.position.z - obstacle.z;
-            const distance = Math.hypot(dx, dz);
-
-            const minimumDistance =
-              koi.collisionRadius +
-              obstacle.radius +
-              0.015;
-
-            if (distance < minimumDistance) {
-              let normalX;
-              let normalZ;
-
-              if (distance < 0.00001) {
-                normalX = 1;
-                normalZ = 0;
-              } else {
-                normalX = dx / distance;
-                normalZ = dz / distance;
-              }
-
-              const correction = minimumDistance - distance;
-              koi.root.position.x += normalX * correction;
-              koi.root.position.z += normalZ * correction;
-            }
-          }
-
-          constrainToPond(koi);
+        // Keep the whole body inside the water (gentle, never a snap).
+        koiCapsule(koi, capsuleA);
+        const limit = safePondRadius(koi);
+        const outer = Math.max(
+          Math.hypot(capsuleA.ax, capsuleA.az),
+          Math.hypot(capsuleA.bx, capsuleA.bz)
+        );
+        const centreRadius = Math.hypot(koi.root.position.x, koi.root.position.z);
+        if (outer > limit && centreRadius > 1e-4) {
+          const excess = (outer - limit) * 0.5;
+          koi.root.position.x -= (koi.root.position.x / centreRadius) * excess;
+          koi.root.position.z -= (koi.root.position.z / centreRadius) * excess;
         }
       }
     }
@@ -3096,6 +3072,7 @@
     let lastWaterfallRipple = -2;
 
     function updateFish(dt, time) {
+      if (!(dt > 0)) return;
       for (const koi of fish) {
         koi.biteCooldown = Math.max(0, koi.biteCooldown - dt);
         koi.eatTimer = Math.max(0, koi.eatTimer - dt);
@@ -3122,7 +3099,7 @@
 
           if (
             koi.wanderTimer <= 0 ||
-            koi.root.position.distanceToSquared(koi.wanderTarget) < 0.12
+            koi.root.position.distanceToSquared(koi.wanderTarget) < 0.3
           ) {
             chooseWanderTarget(koi);
           }
@@ -3146,13 +3123,44 @@
         }
 
         const avoidance = computeAvoidanceSteering(koi);
-        let steeringX = directionX + avoidance.x * 1.35;
-        let steeringZ = directionZ + avoidance.z * 1.35;
+        // Smooth the avoidance force so it never flips frame to frame.
+        const avoidBlend = 1 - Math.exp(-dt * 6);
+        koi.avoidX = lerp(koi.avoidX || 0, avoidance.x, avoidBlend);
+        koi.avoidZ = lerp(koi.avoidZ || 0, avoidance.z, avoidBlend);
+
+        let steeringX = directionX + koi.avoidX;
+        let steeringZ = directionZ + koi.avoidZ;
         const steeringLength = Math.hypot(steeringX, steeringZ);
 
         if (steeringLength > 0.0001) {
           steeringX /= steeringLength;
           steeringZ /= steeringLength;
+        } else {
+          steeringX = Math.cos(koi.yaw);
+          steeringZ = -Math.sin(koi.yaw);
+        }
+
+        // If the wander target is blocked (forces cancel out), pick a new one.
+        if (!feeding) {
+          koi.blockedTime = steeringLength < 0.35
+            ? (koi.blockedTime || 0) + dt
+            : 0;
+          if (koi.blockedTime > 0.8) {
+            chooseWanderTarget(koi);
+            koi.blockedTime = 0;
+          }
+
+          // If the koi is just looping around without making progress,
+          // give it somewhere new to go.
+          koi.progressTime = (koi.progressTime || 0) + dt;
+          if (!koi.progressFrom) koi.progressFrom = koi.root.position.clone();
+          if (koi.progressTime > 2.5) {
+            if (koi.root.position.distanceTo(koi.progressFrom) < 0.8) {
+              chooseWanderTarget(koi);
+            }
+            koi.progressFrom.copy(koi.root.position);
+            koi.progressTime = 0;
+          }
         }
 
         let desiredSpeed = koi.speed * (feeding ? 2.75 : 1);
@@ -3180,7 +3188,7 @@
         const desiredVelocityX = steeringX * desiredSpeed;
         const desiredVelocityZ = steeringZ * desiredSpeed;
 
-        const response = 1 - Math.exp(-dt * (feeding ? 5.2 : 2.6));
+        const response = 1 - Math.exp(-dt * (feeding ? 5.2 : 3.6));
         koi.velocity.x = lerp(
           koi.velocity.x,
           desiredVelocityX,
@@ -3192,6 +3200,19 @@
           response
         );
 
+        // Turning shouldn't bleed off speed: ease the magnitude toward the
+        // desired swim speed separately from the direction.
+        const blendedSpeed = Math.hypot(koi.velocity.x, koi.velocity.y);
+        if (blendedSpeed > 0.02 && desiredSpeed > 0.02) {
+          const targetMagnitude = lerp(
+            blendedSpeed,
+            desiredSpeed,
+            1 - Math.exp(-dt * 4)
+          );
+          koi.velocity.x *= targetMagnitude / blendedSpeed;
+          koi.velocity.y *= targetMagnitude / blendedSpeed;
+        }
+
         koi.root.position.x += koi.velocity.x * dt;
         koi.root.position.z += koi.velocity.y * dt;
 
@@ -3202,9 +3223,19 @@
           (desiredHeight - koi.root.position.y) *
           (1 - Math.exp(-dt * 2.6));
 
-        const desiredYaw = Math.atan2(-steeringZ, steeringX);
-        const turnRate = 1 - Math.exp(-dt * (feeding ? 6.2 : 3.2));
-        koi.yaw += shortestAngle(koi.yaw, desiredYaw) * turnRate;
+        // Heading follows the actual swimming direction, smoothed and
+        // rate-limited so it can't twitch.
+        const swimSpeed = Math.hypot(koi.velocity.x, koi.velocity.y);
+        const headingX = swimSpeed > 0.06 ? koi.velocity.x : steeringX;
+        const headingZ = swimSpeed > 0.06 ? koi.velocity.y : steeringZ;
+        const desiredYaw = Math.atan2(-headingZ, headingX);
+        const turnRate = 1 - Math.exp(-dt * (feeding ? 5.5 : 3.0));
+        const maxTurn = (feeding ? 3.6 : 2.2) * dt;
+        koi.yaw += clamp(
+          shortestAngle(koi.yaw, desiredYaw) * turnRate,
+          -maxTurn,
+          maxTurn
+        );
 
         koi.root.rotation.y = koi.yaw;
 
@@ -3476,14 +3507,19 @@
     }
 
     function animate() {
-      const dt = Math.min(clock.getDelta(), 0.05);
+      const rawDelta = clock.getDelta();
+      const dt = Number.isFinite(rawDelta) ? clamp(rawDelta, 0, 0.05) : 0;
       const time = clock.elapsedTime;
 
       waterUniforms.uTime.value = time;
       waterfallUniforms.uTime.value = time;
 
       updateFood(dt, time);
-      updateFish(dt, time);
+      // Sub-step the koi at up to 60 Hz so slow devices steer as well as fast ones.
+      const fishSteps = Math.max(1, Math.ceil(dt / (1 / 60) - 1e-6));
+      for (let fishStep = 0; fishStep < fishSteps; fishStep++) {
+        updateFish(dt / fishSteps, time);
+      }
       updateParticles(dt);
       updateFoodRipples(dt);
       updateWaterfall(dt, time);
