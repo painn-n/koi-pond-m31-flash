@@ -833,7 +833,7 @@
     // Pond floor: deepest in the middle, shelving up toward the bank so the
     // edges are genuinely shallow (water colour then comes from real depth).
     function pondFloorY(radius) {
-      return -0.775 + 0.32 * sstep(3.4, 6.3, radius);
+      return -0.775 + 0.17 * sstep(3.4, 6.3, radius);
     }
 
     const groundMaterial = new THREE.MeshStandardMaterial({
@@ -3070,6 +3070,56 @@
 
     // Capsule along the koi's spine: snout ~0.62, tail root ~-0.78,
     // half-width ~0.22 (all multiplied by the koi's scale).
+    // Vertical clearance: koi glide under lily pads instead of through them,
+    // and never break the water surface.
+    const LILY_PADS = swimObstacles.filter((obstacle) => obstacle.type === "lily");
+    const PAD_BOTTOM = 0.247 - 0.012 - 0.008; // lowest bob + tilt of a floating pad
+    const PAD_CLEARANCE = 0.035;
+    const SURFACE_CEILING = WATER_LEVEL - 0.006; // dorsal tip may just reach the surface
+    const _koiBox = new THREE.Box3();
+    const _clearCapsule = {};
+
+    function koiTopOffset(koi) {
+      if (koi.topOffset === undefined) {
+        koi.root.updateMatrixWorld(true);
+        _koiBox.setFromObject(koi.root, true);
+        // + allowance for the tail/fin flex and body bob
+        koi.topOffset = _koiBox.max.y - koi.root.position.y + 0.025 * koi.scale;
+        koi.bottomOffset = koi.root.position.y - _koiBox.min.y + 0.02 * koi.scale;
+      }
+      return koi.topOffset;
+    }
+
+    function padSegmentDistance(px, pz, c) {
+      const ex = c.bx - c.ax;
+      const ez = c.bz - c.az;
+      const t = clamp(((px - c.ax) * ex + (pz - c.az) * ez) / (ex * ex + ez * ez || 1), 0, 1);
+      return Math.hypot(px - (c.ax + ex * t), pz - (c.az + ez * t));
+    }
+
+    // Highest allowed root height. soft = ramp in ahead of a pad so the
+    // dive is gentle; hard = exact footprint overlap only.
+    function koiRootCeiling(koi, soft) {
+      koiCapsule(koi, _clearCapsule);
+      let cover = 0;
+      for (const pad of LILY_PADS) {
+        const reach = pad.radius / 1.05 + _clearCapsule.r;
+        const d = padSegmentDistance(pad.x, pad.z, _clearCapsule);
+        const c = soft
+          ? 1 - THREE.MathUtils.smoothstep(d, reach, reach + 0.55)
+          : d < reach + 0.02 ? 1 : 0;
+        if (c > cover) cover = c;
+      }
+      const topLimit = lerp(SURFACE_CEILING, PAD_BOTTOM - PAD_CLEARANCE, cover);
+      return topLimit - koiTopOffset(koi);
+    }
+
+    function koiRootFloor(koi) {
+      koiTopOffset(koi);
+      const r = Math.hypot(koi.root.position.x, koi.root.position.z) + 0.6 * koi.scale;
+      return pondFloorY(r) + koi.bottomOffset + 0.03;
+    }
+
     function koiCapsule(koi, out) {
       const forwardX = Math.cos(koi.yaw);
       const forwardZ = -Math.sin(koi.yaw);
@@ -3435,12 +3485,16 @@
         koi.root.position.x += koi.velocity.x * dt;
         koi.root.position.z += koi.velocity.y * dt;
 
+        const softCeiling = koiRootCeiling(koi, true);
         const desiredHeight =
-          targetY + Math.sin(time * 1.65 + koi.phase) * 0.018;
+          Math.max(Math.min(targetY, softCeiling - 0.02), koiRootFloor(koi)) +
+          Math.sin(time * 1.65 + koi.phase) * 0.018;
+        const heightRate = koi.root.position.y > softCeiling ? 7 : 2.6;
 
         koi.root.position.y +=
           (desiredHeight - koi.root.position.y) *
-          (1 - Math.exp(-dt * 2.6));
+          (1 - Math.exp(-dt * heightRate));
+        koi.root.position.y = Math.min(koi.root.position.y, koiRootCeiling(koi, false));
 
         // Heading follows the actual swimming direction, smoothed and
         // rate-limited so it can't twitch.
