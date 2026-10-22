@@ -512,6 +512,7 @@
 
     const clamp = THREE.MathUtils.clamp;
     const lerp = THREE.MathUtils.lerp;
+    const sstep = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
 
     function shortestAngle(from, to) {
       return Math.atan2(Math.sin(to - from), Math.cos(to - from));
@@ -821,13 +822,19 @@
     fillLight.position.set(8, 6, -10);
     scene.add(fillLight);
 
-    const underwaterLight = new THREE.PointLight(0x70d9d0, 2.6, 13, 2);
+    const underwaterLight = new THREE.PointLight(0x70d9d0, 0.9, 13, 2);
     underwaterLight.position.set(0, -0.15, 0.8);
     scene.add(underwaterLight);
 
     // ------------------------------------------------------------------
     // Garden ground and pond basin
     // ------------------------------------------------------------------
+
+    // Pond floor: deepest in the middle, shelving up toward the bank so the
+    // edges are genuinely shallow (water colour then comes from real depth).
+    function pondFloorY(radius) {
+      return -0.775 + 0.32 * sstep(3.4, 6.3, radius);
+    }
 
     const groundMaterial = new THREE.MeshStandardMaterial({
       map: groundTexture,
@@ -837,7 +844,7 @@
     });
 
     const ground = new THREE.Mesh(
-      new THREE.RingGeometry(6.23, 38, 160, 8),
+      new THREE.RingGeometry(6.45, 38, 160, 8),
       groundMaterial
     );
     ground.rotation.x = -Math.PI / 2;
@@ -846,10 +853,11 @@
     scene.add(ground);
 
     function createBankGeometry() {
-      const radialSteps = 12;
+      const radialSteps = 18;
       const segments = 128;
       const positions = [];
       const uvs = [];
+      const colors = [];
       const indices = [];
 
       for (let r = 0; r <= radialSteps; r++) {
@@ -859,6 +867,8 @@
         for (let s = 0; s <= segments; s++) {
           const angle = (s / segments) * Math.PI * 2;
           let y = lerp(0.235, -0.3, Math.pow(t, 0.78));
+          // raised lip: a few cm above the water line, rounding over outward
+          y += 0.04 * (1 - sstep(0.0, 0.42, t));
           y += Math.sin(angle * 7.0) * 0.035 * t;
           y += Math.sin(angle * 13.0 + 0.8) * 0.018 * t;
 
@@ -868,6 +878,10 @@
             Math.sin(angle) * radius
           );
           uvs.push(t, s / segments);
+          // wet, darker soil right at the waterline, drying outward
+          const wet = 1 - sstep(0.0, 0.2, t + Math.sin(angle * 11.0) * 0.02);
+          const shade = 1 - wet * 0.42;
+          colors.push(shade * (1 - wet * 0.05), shade, shade * (1 - wet * 0.02));
         }
       }
 
@@ -887,6 +901,7 @@
         new THREE.Float32BufferAttribute(positions, 3)
       );
       geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+      geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
       geometry.setIndex(indices);
       geometry.computeVertexNormals();
       return geometry;
@@ -897,29 +912,56 @@
       new THREE.MeshStandardMaterial({
         map: groundTexture,
         color: 0x89916a,
-        roughness: 1
+        roughness: 1,
+        vertexColors: true
       })
     );
     bank.receiveShadow = true;
     scene.add(bank);
 
+    const pondWallGeometry = new THREE.CylinderGeometry(6.19, 6.4, 1.055, 96, 14, true);
+    {
+      const pos = pondWallGeometry.attributes.position;
+      const wallColors = [];
+      for (let i = 0; i < pos.count; i++) {
+        const y = pos.getY(i) - 0.2525; // world y
+        const a = Math.atan2(pos.getZ(i), pos.getX(i));
+        // darker wet band from under the surface up to a ragged line above it
+        const wetTop = 0.255 + Math.sin(a * 9.0) * 0.012 + Math.sin(a * 23.0) * 0.006;
+        const above = sstep(wetTop - 0.02, wetTop + 0.012, y);
+        const nearLine = 1 - sstep(0.0, 0.32, Math.abs(y - 0.225));
+        const shade = lerp(0.86 - nearLine * 0.06, 1.0, above);
+        wallColors.push(shade * 0.98, shade, shade * 0.96);
+      }
+      pondWallGeometry.setAttribute("color", new THREE.Float32BufferAttribute(wallColors, 3));
+    }
     const pondWall = new THREE.Mesh(
-      new THREE.CylinderGeometry(6.26, 6.4, 1.02, 96, 1, true),
+      pondWallGeometry,
       new THREE.MeshStandardMaterial({
-        color: 0x59645c,
-        roughness: 0.95,
-        side: THREE.DoubleSide
+        color: 0x9c9172,
+        roughness: 1,
+        side: THREE.DoubleSide,
+        vertexColors: true
       })
     );
-    pondWall.position.y = -0.27;
+    pondWall.position.y = -0.2525;
     pondWall.receiveShadow = true;
     scene.add(pondWall);
 
+    const pondBottomGeometry = new THREE.RingGeometry(0, 6.42, 96, 30);
+    {
+      const pos = pondBottomGeometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const rr = Math.hypot(pos.getX(i), pos.getY(i));
+        pos.setZ(i, pondFloorY(rr) + 0.775);
+      }
+      pondBottomGeometry.computeVertexNormals();
+    }
     const pondBottom = new THREE.Mesh(
-      new THREE.CircleGeometry(6.29, 96),
+      pondBottomGeometry,
       new THREE.MeshStandardMaterial({
         map: sandTexture,
-        color: 0xd2bd87,
+        color: 0x9a8a62,
         roughness: 0.94
       })
     );
@@ -945,7 +987,7 @@
       patch.rotation.x = -Math.PI / 2;
       patch.position.set(
         Math.cos(angle) * radius,
-        -0.767,
+        pondFloorY(radius) + 0.012,
         Math.sin(angle) * radius
       );
       scene.add(patch);
@@ -969,6 +1011,9 @@
 
     const WATER_LEVEL = 0.225;
     const REFLECTION_SCALE = 0.5;
+    const REFRACTION_SCALE = 0.75;
+    const refrW = () => Math.max(2, Math.floor(drawingSize.x * REFRACTION_SCALE));
+    const refrH = () => Math.max(2, Math.floor(drawingSize.y * REFRACTION_SCALE));
 
     // Tileable water normal map (height = sum of integer-frequency waves).
     function createWaterNormalTexture(size = 256) {
@@ -1039,10 +1084,10 @@
     );
     reflectionTarget.texture.generateMipmaps = false;
 
-    const refractionDepth = new THREE.DepthTexture(drawingSize.x, drawingSize.y);
+    const refractionDepth = new THREE.DepthTexture(refrW(), refrH());
     const refractionTarget = new THREE.WebGLRenderTarget(
-      drawingSize.x,
-      drawingSize.y,
+      refrW(),
+      refrH(),
       { type: THREE.HalfFloatType, depthTexture: refractionDepth }
     );
     refractionTarget.texture.generateMipmaps = false;
@@ -1073,18 +1118,11 @@
       depthWrite: true,
       side: THREE.DoubleSide,
       vertexShader: `
-        uniform float uTime;
         varying vec3 vWorldPosition;
         varying float vViewZ;
 
         void main() {
-          vec3 p = position;
-          // Very low swell so the planar reflection stays coherent.
-          float swell = sin(p.x * 0.84 + uTime * 1.35) * 0.008 +
-                        sin(p.y * 1.18 - uTime * 0.92) * 0.006;
-          p.z += swell;
-
-          vec4 worldPosition = modelMatrix * vec4(p, 1.0);
+          vec4 worldPosition = modelMatrix * vec4(position, 1.0);
           vWorldPosition = worldPosition.xyz;
           vec4 viewPosition = viewMatrix * worldPosition;
           vViewZ = viewPosition.z;
@@ -1111,35 +1149,48 @@
         varying float vViewZ;
 
         float sceneViewZ(vec2 uv) {
-          float d = texture2D(tDepth, uv).x;
-          return perspectiveDepthToViewZ(d, uCameraNear, uCameraFar);
+          return perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uCameraNear, uCameraFar);
         }
 
         float softCaustic(vec2 q, float t) {
           float a = sin(q.x * 1.1 + sin(q.y * 0.7 + t * 0.35) * 1.3);
           float b = sin(q.y * 0.95 - sin(q.x * 0.6 - t * 0.28) * 1.3);
           float c = sin((q.x + q.y) * 0.62 + t * 0.22);
-          float v = 1.0 - abs(a + b + c * 0.6) * 0.42;
-          return smoothstep(0.35, 1.0, v);
+          return smoothstep(0.4, 1.0, 1.0 - abs(a + b + c * 0.6) * 0.42);
+        }
+
+        float hash12(vec2 q) {
+          vec3 p3 = fract(vec3(q.xyx) * 0.1031);
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.x + p3.y) * p3.z);
         }
 
         void main() {
           vec2 p = vWorldPosition.xz;
-          float r = length(p);
           float time = uTime;
           vec3 viewDirection = normalize(cameraPosition - vWorldPosition);
-
-          // --- Two scrolling normal-map layers + fine detail ---
-          vec4 n1 = texture2D(tNormal, p * 0.085 + vec2(time * 0.011, time * 0.006));
-          vec4 n2 = texture2D(tNormal, p * 0.23 + vec2(-time * 0.017, time * 0.021));
-          vec4 n3 = texture2D(tNormal, p * 0.61 + vec2(time * 0.028, -time * 0.024));
           float viewDistance = length(cameraPosition - vWorldPosition);
-          float detailFade = mix(1.0, 0.4, smoothstep(8.0, 24.0, viewDistance));
-          vec2 slope = ((n1.xy * 2.0 - 1.0) * 0.36 +
-                        (n2.xy * 2.0 - 1.0) * 0.22 +
-                        (n3.xy * 2.0 - 1.0) * 0.10 * detailFade) * mix(1.0, 0.6, 1.0 - viewDirection.y);
+          float farFade = smoothstep(7.0, 24.0, viewDistance);
 
-          // --- Feeding / waterfall ripples as normal perturbation ---
+          // --- Wind: drifting patches of calm vs ruffled water ---
+          vec4 gA = texture2D(tNormal, p * 0.034 + vec2(time * 0.0055, -time * 0.0035));
+          vec4 gB = texture2D(tNormal, p * 0.077 + vec2(-time * 0.008, time * 0.006) + 0.37);
+          float g1 = gA.a;
+          float g2 = gB.a;
+          float ruffle = smoothstep(0.36, 0.74, g1 * 0.62 + g2 * 0.38);
+          float windAmp = mix(0.18, 1.0, ruffle);
+
+          // --- Small-scale, low-amplitude wind ripples (no big smooth bumps) ---
+          vec4 n1 = texture2D(tNormal, p * 0.47 + vec2(time * 0.034, time * 0.013));
+          vec4 n2 = texture2D(tNormal, p * 1.19 + vec2(-time * 0.052, time * 0.039), -0.7);
+          vec4 n3 = texture2D(tNormal, p * 2.87 + vec2(time * 0.091, -time * 0.066), -0.7);
+          vec4 n4 = texture2D(tNormal, p.yx * 6.3 + vec2(-time * 0.15, -time * 0.12));
+          vec2 slope = (n1.xy * 2.0 - 1.0) * 0.07 * mix(0.55, 1.0, ruffle) +
+                       ((n2.xy * 2.0 - 1.0) * 0.10 +
+                        (n3.xy * 2.0 - 1.0) * 0.085 * (1.0 - farFade * 0.6) +
+                        (n4.xy * 2.0 - 1.0) * 0.06 * (1.0 - farFade)) * windAmp;
+
+          // --- Feeding / waterfall rings (unchanged behaviour) ---
           float rippleLight = 0.0;
           for (int i = 0; i < 8; i++) {
             float age = time - uRipples[i].z;
@@ -1148,72 +1199,76 @@
               float dist = length(toP);
               float front = dist - age * 1.24;
               float envelope = exp(-front * front * 26.0) * exp(-age * 0.75) * uRipples[i].w;
-              float wave = sin(front * 22.0) * envelope;
-              slope += (toP / max(dist, 0.001)) * wave * 0.45;
+              slope += (toP / max(dist, 0.001)) * sin(front * 22.0) * envelope * 0.32;
               rippleLight += envelope;
             }
           }
-
           vec3 normal = normalize(vec3(slope.x, 1.0, slope.y));
 
-          // --- Schlick Fresnel (water F0 ~ 0.02) ---
+          // --- Schlick Fresnel, water F0 = 0.02 (about 2% looking straight down) ---
           float cosTheta = clamp(dot(viewDirection, normal), 0.0, 1.0);
           float fresnel = 0.02 + 0.98 * pow(1.0 - cosTheta, 5.0);
-          fresnel = clamp(fresnel, 0.02, 0.94);
+          fresnel = min(fresnel, 0.9);
 
-          // --- Planar reflection (sky, rocks, waterfall, trees, lantern) ---
-          vec4 reflectionCoord = uReflectionMatrix * vec4(vWorldPosition, 1.0);
-          reflectionCoord.xy += normal.xz * 0.045 * reflectionCoord.w;
-          vec3 reflection = texture2DProj(tReflection, reflectionCoord).rgb;
-          vec3 skyFallback = mix(vec3(0.78, 0.77, 0.66), vec3(0.42, 0.62, 0.70),
+          // --- Planar reflection, broken up by ripples and softly blurred ---
+          vec4 rc = uReflectionMatrix * vec4(vWorldPosition, 1.0);
+          vec2 ruv = rc.xy / rc.w + slope * (0.05 + 0.06 * ruffle);
+          vec2 texel = 2.0 / uResolution * (1.2 + 2.4 * ruffle);
+          vec3 reflection = texture2D(tReflection, ruv).rgb * 0.4 +
+            texture2D(tReflection, ruv + vec2(texel.x, texel.y * 0.6)).rgb * 0.3 +
+            texture2D(tReflection, ruv + vec2(-texel.x * 0.8, -texel.y)).rgb * 0.3;
+          vec3 skyFallback = mix(vec3(0.70, 0.71, 0.63), vec3(0.40, 0.56, 0.62),
                                  clamp(reflect(-viewDirection, normal).y * 1.6, 0.0, 1.0));
           reflection = mix(skyFallback, reflection, uReflectionOn);
 
-          // --- Refraction with depth-aware distortion ---
+          // --- Refraction: floor and fish wobble a little under the ripples ---
           vec2 screenUv = gl_FragCoord.xy / uResolution;
-          float surfaceZ = vViewZ;
-          float rawThickness = max(surfaceZ - sceneViewZ(screenUv), 0.0);
-          float edgeFade = smoothstep(uPondRadius, uPondRadius - 0.6, r);
-          vec2 refractUv = screenUv + normal.xz * 0.028 * clamp(rawThickness, 0.0, 1.0) * edgeFade;
-          float refractThickness = surfaceZ - sceneViewZ(refractUv);
-          if (refractThickness < 0.0) {
+          float rawThickness = max(vViewZ - sceneViewZ(screenUv), 0.0);
+          vec2 refractUv = screenUv + slope * 0.07 * clamp(rawThickness * 1.4, 0.0, 1.0);
+          float thickness = vViewZ - sceneViewZ(refractUv);
+          if (thickness < 0.0) {
             refractUv = screenUv;
-            refractThickness = rawThickness;
+            thickness = rawThickness;
           }
           vec3 refracted = texture2D(tRefraction, refractUv).rgb;
 
-          // --- Soft, blurred, depth-attenuated caustics on the floor only ---
-          vec2 floorP = p - viewDirection.xz / max(viewDirection.y, 0.25) * 1.0;
+          // Length of the view ray inside the water, from the depth prepass.
+          float rayLength = thickness * viewDistance / max(-vViewZ, 0.05);
+
+          // --- Very faint, blurred caustics, only on the deeper floor ---
+          vec2 floorP = p - viewDirection.xz / max(viewDirection.y, 0.25);
           float caustic = (softCaustic(floorP, time) + softCaustic(floorP + vec2(0.23, -0.17), time)) * 0.5;
-          float floorMask = smoothstep(0.55, 1.05, refractThickness);
-          refracted *= 1.0 + caustic * 0.13 * floorMask * edgeFade;
+          refracted *= 1.0 + caustic * 0.06 * smoothstep(0.35, 0.9, thickness) * (1.0 - farFade * 0.5);
 
-          // --- Depth-based absorption: clear at the edges, teal-green in the middle ---
-          float bowl = smoothstep(uPondRadius - 0.2, 1.2, r) * 1.0;
-          float pathLength = refractThickness * 0.85 + bowl;
-          vec3 absorption = vec3(1.05, 0.34, 0.3);
-          vec3 transmittance = exp(-absorption * pathLength);
-          vec3 scatterColor = vec3(0.035, 0.2, 0.21) * (0.65 + 0.35 * max(uSunDirection.y, 0.0));
-          vec3 waterBody = refracted * transmittance + scatterColor * (1.0 - transmittance);
+          // --- Beer-Lambert absorption + murky in-scatter (greenish-brown / teal) ---
+          float murk = clamp(gB.x * 1.6 - 0.3, 0.0, 1.0);
+          vec3 sigma = vec3(1.55, 0.78, 0.82) * mix(0.82, 1.2, murk);
+          vec3 transmittance = exp(-sigma * rayLength);
+          vec3 inScatter = mix(vec3(0.05, 0.085, 0.06), vec3(0.032, 0.085, 0.08), murk);
+          vec3 waterBody = refracted * transmittance + inScatter * (1.0 - transmittance);
+          // suspended particles: faint drifting motes in the water body
+          vec2 moteCell = floor(refractUv * uResolution / 3.0 + vec2(time * 0.7, time * 0.4));
+          float mote = step(0.992, hash12(moteCell)) * (1.0 - farFade) * smoothstep(0.15, 0.6, rayLength);
+          waterBody += vec3(0.05, 0.055, 0.045) * mote * 0.5;
 
-          // --- Combine with Fresnel ---
+          // --- Combine ---
           vec3 color = mix(waterBody, reflection, fresnel);
 
-          // --- Soft sun specular ---
+          // --- Small sparkly sun glints, mostly where the wind ruffles the water ---
           vec3 halfVector = normalize(uSunDirection + viewDirection);
           float nh = max(dot(normal, halfVector), 0.0);
-          color += uSunColor * (pow(nh, 600.0) * 2.6 + pow(nh, 90.0) * 0.12);
+          float glint = pow(nh, 2400.0) * 9.0 * (0.25 + 0.75 * ruffle) + pow(nh, 420.0) * 0.18 * ruffle;
+          color += uSunColor * glint * (0.35 + 0.65 * fresnel / 0.1) * 0.25;
 
-          // --- Ripples catch a little light ---
-          color += vec3(0.6, 0.7, 0.68) * clamp(rippleLight, 0.0, 1.0) * 0.06;
+          color += vec3(0.55, 0.62, 0.6) * clamp(rippleLight, 0.0, 1.0) * 0.035;
 
-          // --- Shoreline softening and contact foam (rocks, banks, fish at surface) ---
-          float foamNoise = n2.a * 0.6 + n3.a * 0.4;
-          float shore = smoothstep(uPondRadius - 0.32, uPondRadius - 0.02, r);
-          float contact = 1.0 - smoothstep(0.0, 0.11, rawThickness);
-          float foam = max(shore * 0.75, contact) * smoothstep(0.35, 0.72, foamNoise);
-          color = mix(color, vec3(0.86, 0.92, 0.88), foam * 0.32);
-          color = mix(color, color * 0.92 + vec3(0.02, 0.03, 0.025), shore * 0.35);
+          // --- Light surface dust / pollen film collecting in calm patches ---
+          float dust = smoothstep(0.45, 0.62, gA.y) * (1.0 - ruffle);
+          color = mix(color, vec3(0.32, 0.33, 0.27), dust * 0.07);
+
+          // --- Contact with banks, stones and pads: water thins to clear, no rim ---
+          float contact = 1.0 - smoothstep(0.0, 0.09, rawThickness);
+          color = mix(color, mix(refracted * 0.86, color, 0.35), contact * 0.6);
 
           gl_FragColor = vec4(color, 1.0);
           #include <tonemapping_fragment>
@@ -1223,7 +1278,7 @@
     });
 
     const pondWater = new THREE.Mesh(
-      new THREE.CircleGeometry(POND_WATER_RADIUS, 128),
+      new THREE.CircleGeometry(POND_WATER_RADIUS + 0.03, 160),
       waterMaterial
     );
     pondWater.rotation.x = -Math.PI / 2;
@@ -1401,7 +1456,7 @@
 
       dummy.position.set(
         Math.cos(angle) * radius,
-        -0.72 + range(-0.025, 0.025),
+        pondFloorY(radius) + 0.055 + range(-0.025, 0.025),
         Math.sin(angle) * radius
       );
       dummy.rotation.set(range(0, 3), range(0, 3), range(0, 3));
@@ -1843,6 +1898,7 @@
         })
       );
       pad.receiveShadow = true;
+      pad.castShadow = true;
       group.add(pad);
 
       const veinMaterial = new THREE.LineBasicMaterial({
@@ -1964,7 +2020,7 @@
 
       tuft.position.set(
         Math.cos(angle) * radius,
-        -0.72,
+        pondFloorY(radius) + 0.055,
         Math.sin(angle) * radius
       );
 
@@ -3696,10 +3752,10 @@
     function syncWaterTargets() {
       renderer.getDrawingBufferSize(drawingSize);
       if (
-        refractionTarget.width !== drawingSize.x ||
-        refractionTarget.height !== drawingSize.y
+        refractionTarget.width !== refrW() ||
+        refractionTarget.height !== refrH()
       ) {
-        refractionTarget.setSize(drawingSize.x, drawingSize.y);
+        refractionTarget.setSize(refrW(), refrH());
         reflectionTarget.setSize(
           Math.max(2, Math.floor(drawingSize.x * REFLECTION_SCALE)),
           Math.max(2, Math.floor(drawingSize.y * REFLECTION_SCALE))
@@ -3741,7 +3797,12 @@
       return true;
     }
 
+    let fishShadowsReady = false;
     function renderWaterPasses() {
+      if (!fishShadowsReady) {
+        fishShadowsReady = true;
+        for (const koi of fish) koi.root.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+      }
       syncWaterTargets();
       const previousTarget = renderer.getRenderTarget();
       const previousAutoUpdate = renderer.shadowMap.autoUpdate;
