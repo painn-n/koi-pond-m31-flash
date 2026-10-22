@@ -821,7 +821,7 @@
     fillLight.position.set(8, 6, -10);
     scene.add(fillLight);
 
-    const underwaterLight = new THREE.PointLight(0x70d9d0, 7, 13, 2);
+    const underwaterLight = new THREE.PointLight(0x70d9d0, 2.6, 13, 2);
     underwaterLight.position.set(0, -0.15, 0.8);
     scene.add(underwaterLight);
 
@@ -961,98 +961,261 @@
     );
     let rippleIndex = 0;
 
+    // ------------------------------------------------------------------
+    // Realistic water: planar reflection + refraction render targets,
+    // Schlick Fresnel, two scrolling normal-map layers, depth absorption,
+    // soft depth-attenuated caustics, sun specular and shoreline foam.
+    // ------------------------------------------------------------------
+
+    const WATER_LEVEL = 0.225;
+    const REFLECTION_SCALE = 0.5;
+
+    // Tileable water normal map (height = sum of integer-frequency waves).
+    function createWaterNormalTexture(size = 256) {
+      const rng = mulberry32(7741);
+      const waves = [];
+      for (let i = 0; i < 26; i++) {
+        let kx = 0;
+        let ky = 0;
+        while (kx === 0 && ky === 0) {
+          kx = Math.round((rng() * 2 - 1) * 9);
+          ky = Math.round((rng() * 2 - 1) * 9);
+        }
+        const k = Math.hypot(kx, ky);
+        waves.push({ kx, ky, amp: 1 / Math.pow(k, 1.25), phase: rng() * Math.PI * 2 });
+      }
+      const data = new Uint8Array(size * size * 4);
+      const heights = new Float32Array(size * size);
+      let minH = Infinity;
+      let maxH = -Infinity;
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const u = (x / size) * Math.PI * 2;
+          const v = (y / size) * Math.PI * 2;
+          let h = 0;
+          let dx = 0;
+          let dy = 0;
+          for (const w of waves) {
+            const a = w.kx * u + w.ky * v + w.phase;
+            h += Math.sin(a) * w.amp;
+            dx += Math.cos(a) * w.amp * w.kx;
+            dy += Math.cos(a) * w.amp * w.ky;
+          }
+          const i = y * size + x;
+          heights[i] = h;
+          minH = Math.min(minH, h);
+          maxH = Math.max(maxH, h);
+          const strength = 0.11;
+          let nx = -dx * strength;
+          let ny = -dy * strength;
+          const nl = Math.hypot(nx, ny, 1);
+          data[i * 4] = Math.round(((nx / nl) * 0.5 + 0.5) * 255);
+          data[i * 4 + 1] = Math.round(((ny / nl) * 0.5 + 0.5) * 255);
+          data[i * 4 + 2] = Math.round(((1 / nl) * 0.5 + 0.5) * 255);
+        }
+      }
+      for (let i = 0; i < size * size; i++) {
+        data[i * 4 + 3] = Math.round(((heights[i] - minH) / (maxH - minH)) * 255);
+      }
+      const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+      texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+      texture.magFilter = THREE.LinearFilter;
+      texture.minFilter = THREE.LinearMipmapLinearFilter;
+      texture.generateMipmaps = true;
+      texture.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    const waterNormalTexture = createWaterNormalTexture();
+
+    const drawingSize = new THREE.Vector2();
+    renderer.getDrawingBufferSize(drawingSize);
+
+    const reflectionTarget = new THREE.WebGLRenderTarget(
+      Math.max(2, Math.floor(drawingSize.x * REFLECTION_SCALE)),
+      Math.max(2, Math.floor(drawingSize.y * REFLECTION_SCALE)),
+      { type: THREE.HalfFloatType, samples: 0 }
+    );
+    reflectionTarget.texture.generateMipmaps = false;
+
+    const refractionDepth = new THREE.DepthTexture(drawingSize.x, drawingSize.y);
+    const refractionTarget = new THREE.WebGLRenderTarget(
+      drawingSize.x,
+      drawingSize.y,
+      { type: THREE.HalfFloatType, depthTexture: refractionDepth }
+    );
+    refractionTarget.texture.generateMipmaps = false;
+
+    const reflectionCamera = new THREE.PerspectiveCamera();
+    const reflectionTextureMatrix = new THREE.Matrix4();
+
     const waterUniforms = {
       uTime: { value: 0 },
-      uRipples: { value: rippleData }
+      uRipples: { value: rippleData },
+      tReflection: { value: reflectionTarget.texture },
+      tRefraction: { value: refractionTarget.texture },
+      tDepth: { value: refractionDepth },
+      tNormal: { value: waterNormalTexture },
+      uReflectionMatrix: { value: reflectionTextureMatrix },
+      uResolution: { value: drawingSize.clone() },
+      uCameraNear: { value: camera.near },
+      uCameraFar: { value: camera.far },
+      uSunDirection: { value: new THREE.Vector3(-8, 14, 9).normalize() },
+      uSunColor: { value: new THREE.Color(0xffe6b8) },
+      uPondRadius: { value: POND_WATER_RADIUS },
+      uReflectionOn: { value: 1 }
     };
 
     const waterMaterial = new THREE.ShaderMaterial({
       uniforms: waterUniforms,
       transparent: true,
-      depthWrite: false,
+      depthWrite: true,
       side: THREE.DoubleSide,
       vertexShader: `
         uniform float uTime;
         varying vec3 vWorldPosition;
-        varying vec2 vUv;
-        varying float vWave;
+        varying float vViewZ;
 
         void main() {
           vec3 p = position;
-
-          float waveA = sin(p.x * 0.84 + uTime * 1.35) * 0.025;
-          float waveB = sin(p.y * 1.18 - uTime * 0.92) * 0.018;
-          float waveC = sin((p.x + p.y) * 2.15 + uTime * 1.72) * 0.009;
-
-          p.z += waveA + waveB + waveC;
-          vWave = waveA + waveB + waveC;
+          // Very low swell so the planar reflection stays coherent.
+          float swell = sin(p.x * 0.84 + uTime * 1.35) * 0.008 +
+                        sin(p.y * 1.18 - uTime * 0.92) * 0.006;
+          p.z += swell;
 
           vec4 worldPosition = modelMatrix * vec4(p, 1.0);
           vWorldPosition = worldPosition.xyz;
-          vUv = uv;
-
-          gl_Position = projectionMatrix * viewMatrix * worldPosition;
+          vec4 viewPosition = viewMatrix * worldPosition;
+          vViewZ = viewPosition.z;
+          gl_Position = projectionMatrix * viewPosition;
         }
       `,
       fragmentShader: `
+        #include <packing>
         uniform float uTime;
         uniform vec4 uRipples[8];
+        uniform sampler2D tReflection;
+        uniform sampler2D tRefraction;
+        uniform sampler2D tDepth;
+        uniform sampler2D tNormal;
+        uniform mat4 uReflectionMatrix;
+        uniform vec2 uResolution;
+        uniform float uCameraNear;
+        uniform float uCameraFar;
+        uniform vec3 uSunDirection;
+        uniform vec3 uSunColor;
+        uniform float uPondRadius;
+        uniform float uReflectionOn;
         varying vec3 vWorldPosition;
-        varying vec2 vUv;
-        varying float vWave;
+        varying float vViewZ;
+
+        float sceneViewZ(vec2 uv) {
+          float d = texture2D(tDepth, uv).x;
+          return perspectiveDepthToViewZ(d, uCameraNear, uCameraFar);
+        }
+
+        float softCaustic(vec2 q, float t) {
+          float a = sin(q.x * 1.1 + sin(q.y * 0.7 + t * 0.35) * 1.3);
+          float b = sin(q.y * 0.95 - sin(q.x * 0.6 - t * 0.28) * 1.3);
+          float c = sin((q.x + q.y) * 0.62 + t * 0.22);
+          float v = 1.0 - abs(a + b + c * 0.6) * 0.42;
+          return smoothstep(0.35, 1.0, v);
+        }
 
         void main() {
           vec2 p = vWorldPosition.xz;
+          float r = length(p);
           float time = uTime;
-
-          vec3 normal = normalize(vec3(
-            cos(p.x * 0.84 + time * 1.35) * 0.035,
-            1.0,
-            cos(p.y * 1.18 - time * 0.92) * 0.035
-          ));
-
           vec3 viewDirection = normalize(cameraPosition - vWorldPosition);
-          float fresnel = pow(
-            1.0 - clamp(dot(viewDirection, normal), 0.0, 1.0),
-            2.65
-          );
 
-          float a = sin(p.x * 1.65 + sin(p.y * 0.88 + time * 0.57));
-          float b = sin(p.y * 1.42 - sin(p.x * 0.71 - time * 0.43));
-          float caustic = pow(max(0.0, 1.0 - abs(a + b) * 0.68), 7.0);
+          // --- Two scrolling normal-map layers + fine detail ---
+          vec4 n1 = texture2D(tNormal, p * 0.085 + vec2(time * 0.011, time * 0.006));
+          vec4 n2 = texture2D(tNormal, p * 0.23 + vec2(-time * 0.017, time * 0.021));
+          vec4 n3 = texture2D(tNormal, p * 0.61 + vec2(time * 0.028, -time * 0.024));
+          float viewDistance = length(cameraPosition - vWorldPosition);
+          float detailFade = mix(1.0, 0.4, smoothstep(8.0, 24.0, viewDistance));
+          vec2 slope = ((n1.xy * 2.0 - 1.0) * 0.36 +
+                        (n2.xy * 2.0 - 1.0) * 0.22 +
+                        (n3.xy * 2.0 - 1.0) * 0.10 * detailFade) * mix(1.0, 0.6, 1.0 - viewDirection.y);
 
+          // --- Feeding / waterfall ripples as normal perturbation ---
           float rippleLight = 0.0;
           for (int i = 0; i < 8; i++) {
             float age = time - uRipples[i].z;
-
             if (age > 0.0 && age < 4.5) {
-              float distanceToRipple = length(p - uRipples[i].xy);
-              float ring = exp(
-                -pow((distanceToRipple - age * 1.24) * 6.5, 2.0)
-              );
-              rippleLight += ring * exp(-age * 0.72) * uRipples[i].w;
+              vec2 toP = p - uRipples[i].xy;
+              float dist = length(toP);
+              float front = dist - age * 1.24;
+              float envelope = exp(-front * front * 26.0) * exp(-age * 0.75) * uRipples[i].w;
+              float wave = sin(front * 22.0) * envelope;
+              slope += (toP / max(dist, 0.001)) * wave * 0.45;
+              rippleLight += envelope;
             }
           }
 
-          caustic = clamp(caustic + rippleLight * 0.85, 0.0, 1.0);
+          vec3 normal = normalize(vec3(slope.x, 1.0, slope.y));
 
-          vec3 deepColor = vec3(0.055, 0.27, 0.285);
-          vec3 shallowColor = vec3(0.17, 0.52, 0.49);
-          vec3 skyColor = vec3(0.64, 0.84, 0.83);
+          // --- Schlick Fresnel (water F0 ~ 0.02) ---
+          float cosTheta = clamp(dot(viewDirection, normal), 0.0, 1.0);
+          float fresnel = 0.02 + 0.98 * pow(1.0 - cosTheta, 5.0);
+          fresnel = clamp(fresnel, 0.02, 0.94);
 
-          float depthShade = smoothstep(0.0, 7.0, length(p));
-          vec3 color = mix(shallowColor, deepColor, depthShade * 0.44);
-          color = mix(color, skyColor, fresnel * 0.66);
-          color += caustic * vec3(0.38, 0.52, 0.43);
-          color += max(vWave, 0.0) * 0.35;
+          // --- Planar reflection (sky, rocks, waterfall, trees, lantern) ---
+          vec4 reflectionCoord = uReflectionMatrix * vec4(vWorldPosition, 1.0);
+          reflectionCoord.xy += normal.xz * 0.045 * reflectionCoord.w;
+          vec3 reflection = texture2DProj(tReflection, reflectionCoord).rgb;
+          vec3 skyFallback = mix(vec3(0.78, 0.77, 0.66), vec3(0.42, 0.62, 0.70),
+                                 clamp(reflect(-viewDirection, normal).y * 1.6, 0.0, 1.0));
+          reflection = mix(skyFallback, reflection, uReflectionOn);
 
-          float alpha = clamp(
-            0.40 + fresnel * 0.25 + caustic * 0.12,
-            0.0,
-            0.76
-          );
+          // --- Refraction with depth-aware distortion ---
+          vec2 screenUv = gl_FragCoord.xy / uResolution;
+          float surfaceZ = vViewZ;
+          float rawThickness = max(surfaceZ - sceneViewZ(screenUv), 0.0);
+          float edgeFade = smoothstep(uPondRadius, uPondRadius - 0.6, r);
+          vec2 refractUv = screenUv + normal.xz * 0.028 * clamp(rawThickness, 0.0, 1.0) * edgeFade;
+          float refractThickness = surfaceZ - sceneViewZ(refractUv);
+          if (refractThickness < 0.0) {
+            refractUv = screenUv;
+            refractThickness = rawThickness;
+          }
+          vec3 refracted = texture2D(tRefraction, refractUv).rgb;
 
-          gl_FragColor = vec4(color, alpha);
+          // --- Soft, blurred, depth-attenuated caustics on the floor only ---
+          vec2 floorP = p - viewDirection.xz / max(viewDirection.y, 0.25) * 1.0;
+          float caustic = (softCaustic(floorP, time) + softCaustic(floorP + vec2(0.23, -0.17), time)) * 0.5;
+          float floorMask = smoothstep(0.55, 1.05, refractThickness);
+          refracted *= 1.0 + caustic * 0.13 * floorMask * edgeFade;
+
+          // --- Depth-based absorption: clear at the edges, teal-green in the middle ---
+          float bowl = smoothstep(uPondRadius - 0.2, 1.2, r) * 1.0;
+          float pathLength = refractThickness * 0.85 + bowl;
+          vec3 absorption = vec3(1.05, 0.34, 0.3);
+          vec3 transmittance = exp(-absorption * pathLength);
+          vec3 scatterColor = vec3(0.035, 0.2, 0.21) * (0.65 + 0.35 * max(uSunDirection.y, 0.0));
+          vec3 waterBody = refracted * transmittance + scatterColor * (1.0 - transmittance);
+
+          // --- Combine with Fresnel ---
+          vec3 color = mix(waterBody, reflection, fresnel);
+
+          // --- Soft sun specular ---
+          vec3 halfVector = normalize(uSunDirection + viewDirection);
+          float nh = max(dot(normal, halfVector), 0.0);
+          color += uSunColor * (pow(nh, 600.0) * 2.6 + pow(nh, 90.0) * 0.12);
+
+          // --- Ripples catch a little light ---
+          color += vec3(0.6, 0.7, 0.68) * clamp(rippleLight, 0.0, 1.0) * 0.06;
+
+          // --- Shoreline softening and contact foam (rocks, banks, fish at surface) ---
+          float foamNoise = n2.a * 0.6 + n3.a * 0.4;
+          float shore = smoothstep(uPondRadius - 0.32, uPondRadius - 0.02, r);
+          float contact = 1.0 - smoothstep(0.0, 0.11, rawThickness);
+          float foam = max(shore * 0.75, contact) * smoothstep(0.35, 0.72, foamNoise);
+          color = mix(color, vec3(0.86, 0.92, 0.88), foam * 0.32);
+          color = mix(color, color * 0.92 + vec3(0.02, 0.03, 0.025), shore * 0.35);
+
+          gl_FragColor = vec4(color, 1.0);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -1064,7 +1227,7 @@
       waterMaterial
     );
     pondWater.rotation.x = -Math.PI / 2;
-    pondWater.position.y = 0.225;
+    pondWater.position.y = WATER_LEVEL;
     pondWater.renderOrder = 3;
     scene.add(pondWater);
 
@@ -1224,7 +1387,7 @@
     const underwaterPebbles = new THREE.InstancedMesh(
       underwaterPebbleGeometry,
       new THREE.MeshStandardMaterial({
-        color: 0xffffff,
+        color: 0xb7b09c,
         roughness: 0.95,
         flatShading: true
       }),
@@ -3506,6 +3669,116 @@
       fireflyUniforms.uTime.value = time;
     }
 
+    // ------------------------------------------------------------------
+    // Water passes: planar reflection (above-water scene seen from a camera
+    // mirrored in the water plane) and refraction (below-water scene + depth).
+    // ------------------------------------------------------------------
+
+    const reflectionClip = [new THREE.Plane(new THREE.Vector3(0, 1, 0), -(WATER_LEVEL - 0.01))];
+    const refractionClip = [new THREE.Plane(new THREE.Vector3(0, -1, 0), WATER_LEVEL + 0.008)];
+    const refractionHidden = [];
+    scene.traverse((object) => {
+      if (object === pondWater) return;
+      const material = object.material;
+      if (material && material.isShaderMaterial) refractionHidden.push(object);
+    });
+    const underwaterClearColor = new THREE.Color(0x173f3a);
+    const savedClearColor = new THREE.Color();
+    const _cameraWorld = new THREE.Vector3();
+    const _mirrorView = new THREE.Vector3();
+    const _lookAt = new THREE.Vector3();
+    const _mirrorTarget = new THREE.Vector3();
+    const _rotation = new THREE.Matrix4();
+    const _up = new THREE.Vector3();
+    const _planeNormal = new THREE.Vector3(0, 1, 0);
+    const _planePoint = new THREE.Vector3(0, WATER_LEVEL, 0);
+
+    function syncWaterTargets() {
+      renderer.getDrawingBufferSize(drawingSize);
+      if (
+        refractionTarget.width !== drawingSize.x ||
+        refractionTarget.height !== drawingSize.y
+      ) {
+        refractionTarget.setSize(drawingSize.x, drawingSize.y);
+        reflectionTarget.setSize(
+          Math.max(2, Math.floor(drawingSize.x * REFLECTION_SCALE)),
+          Math.max(2, Math.floor(drawingSize.y * REFLECTION_SCALE))
+        );
+      }
+      waterUniforms.uResolution.value.copy(drawingSize);
+      waterUniforms.uCameraNear.value = camera.near;
+      waterUniforms.uCameraFar.value = camera.far;
+    }
+
+    function updateReflectionCamera() {
+      camera.updateMatrixWorld();
+      _cameraWorld.setFromMatrixPosition(camera.matrixWorld);
+      _mirrorView.subVectors(_planePoint, _cameraWorld);
+      if (_mirrorView.dot(_planeNormal) > 0) return false;
+
+      _mirrorView.reflect(_planeNormal).negate().add(_planePoint);
+      _rotation.extractRotation(camera.matrixWorld);
+      _lookAt.set(0, 0, -1).applyMatrix4(_rotation).add(_cameraWorld);
+      _mirrorTarget.subVectors(_planePoint, _lookAt).reflect(_planeNormal).negate().add(_planePoint);
+
+      reflectionCamera.position.copy(_mirrorView);
+      _up.set(0, 1, 0).applyMatrix4(_rotation).reflect(_planeNormal);
+      reflectionCamera.up.copy(_up);
+      reflectionCamera.lookAt(_mirrorTarget);
+      reflectionCamera.near = camera.near;
+      reflectionCamera.far = camera.far;
+      reflectionCamera.updateMatrixWorld();
+      reflectionCamera.projectionMatrix.copy(camera.projectionMatrix);
+
+      reflectionTextureMatrix.set(
+        0.5, 0.0, 0.0, 0.5,
+        0.0, 0.5, 0.0, 0.5,
+        0.0, 0.0, 0.5, 0.5,
+        0.0, 0.0, 0.0, 1.0
+      );
+      reflectionTextureMatrix.multiply(reflectionCamera.projectionMatrix);
+      reflectionTextureMatrix.multiply(reflectionCamera.matrixWorldInverse);
+      return true;
+    }
+
+    function renderWaterPasses() {
+      syncWaterTargets();
+      const previousTarget = renderer.getRenderTarget();
+      const previousAutoUpdate = renderer.shadowMap.autoUpdate;
+      renderer.getClearColor(savedClearColor);
+      const savedClearAlpha = renderer.getClearAlpha();
+      renderer.shadowMap.autoUpdate = false;
+      pondWater.visible = false;
+
+      // Refraction: everything below the surface, plus its depth.
+      const savedBackground = scene.background;
+      scene.background = underwaterClearColor;
+      for (const object of refractionHidden) object.userData.wasVisible = object.visible, object.visible = false;
+      renderer.clippingPlanes = refractionClip;
+      renderer.setRenderTarget(refractionTarget);
+      renderer.clear();
+      renderer.render(scene, camera);
+      for (const object of refractionHidden) object.visible = object.userData.wasVisible;
+      scene.background = savedBackground;
+
+      // Reflection: everything above the surface, mirrored.
+      if (updateReflectionCamera()) {
+        renderer.clippingPlanes = reflectionClip;
+        renderer.setRenderTarget(reflectionTarget);
+        renderer.clear();
+        renderer.render(scene, reflectionCamera);
+        waterUniforms.uReflectionOn.value = 1;
+      } else {
+        waterUniforms.uReflectionOn.value = 0;
+      }
+
+      renderer.clippingPlanes = [];
+      renderer.setRenderTarget(previousTarget);
+      renderer.setClearColor(savedClearColor, savedClearAlpha);
+      renderer.shadowMap.autoUpdate = previousAutoUpdate;
+      pondWater.visible = true;
+    }
+
     function animate() {
       const rawDelta = clock.getDelta();
       const dt = Number.isFinite(rawDelta) ? clamp(rawDelta, 0, 0.05) : 0;
@@ -3528,6 +3801,7 @@
       updateFireflies(time);
 
       controls.update();
+      renderWaterPasses();
       renderer.render(scene, camera);
     }
 
